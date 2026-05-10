@@ -2,6 +2,33 @@ use code_graph_shared::{CodeChunk, SearchHit};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Copy)]
+pub struct PersistedChunkIds {
+    pub chunk_id: Uuid,
+    pub vector_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+pub struct RepositoryRecord {
+    pub id: Uuid,
+    pub name: String,
+    pub branch: String,
+    pub commit_sha: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct RepositoryStats {
+    pub files: i64,
+    pub chunks: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexedFile {
+    pub id: Uuid,
+    pub content_hash: String,
+    pub chunk_count: i64,
+}
+
 #[derive(Clone)]
 pub struct Database {
     pool: PgPool,
@@ -47,6 +74,49 @@ impl Database {
         Ok(row.get("id"))
     }
 
+    pub async fn get_repository(
+        &self,
+        name: &str,
+        branch: &str,
+    ) -> anyhow::Result<Option<RepositoryRecord>> {
+        let row = sqlx::query(
+            r#"
+            SELECT id, name, branch, commit_sha
+            FROM repositories
+            WHERE name = $1 AND branch = $2
+            "#,
+        )
+        .bind(name)
+        .bind(branch)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| RepositoryRecord {
+            id: row.get("id"),
+            name: row.get("name"),
+            branch: row.get("branch"),
+            commit_sha: row.get("commit_sha"),
+        }))
+    }
+
+    pub async fn repository_stats(&self, repo_id: Uuid) -> anyhow::Result<RepositoryStats> {
+        let row = sqlx::query(
+            r#"
+            SELECT
+              (SELECT count(*) FROM files WHERE repo_id = $1) AS files,
+              (SELECT count(*) FROM chunks WHERE repo_id = $1) AS chunks
+            "#,
+        )
+        .bind(repo_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(RepositoryStats {
+            files: row.get("files"),
+            chunks: row.get("chunks"),
+        })
+    }
+
     pub async fn upsert_file(
         &self,
         repo_id: Uuid,
@@ -76,12 +146,64 @@ impl Database {
         Ok(row.get("id"))
     }
 
+    pub async fn clear_repository_index(&self, repo_id: Uuid) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM files WHERE repo_id = $1")
+            .bind(repo_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn get_indexed_file(
+        &self,
+        repo_id: Uuid,
+        path: &str,
+    ) -> anyhow::Result<Option<IndexedFile>> {
+        let row = sqlx::query(
+            r#"
+            SELECT f.id, f.content_hash, count(c.id) AS chunk_count
+            FROM files f
+            LEFT JOIN chunks c ON c.file_id = f.id
+            WHERE f.repo_id = $1 AND f.path = $2
+            GROUP BY f.id, f.content_hash
+            "#,
+        )
+        .bind(repo_id)
+        .bind(path)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|row| IndexedFile {
+            id: row.get("id"),
+            content_hash: row.get("content_hash"),
+            chunk_count: row.get("chunk_count"),
+        }))
+    }
+
+    pub async fn delete_file(&self, repo_id: Uuid, path: &str) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM files WHERE repo_id = $1 AND path = $2")
+            .bind(repo_id)
+            .bind(path)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn delete_files_except(&self, repo_id: Uuid, paths: &[String]) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM files WHERE repo_id = $1 AND NOT (path = ANY($2))")
+            .bind(repo_id)
+            .bind(paths)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     pub async fn insert_chunk(
         &self,
         repo_id: Uuid,
         file_id: Uuid,
         chunk: &CodeChunk,
-    ) -> anyhow::Result<Uuid> {
+    ) -> anyhow::Result<PersistedChunkIds> {
         let id = Uuid::new_v4();
         let vector_id = chunk.vector_id.unwrap_or_else(Uuid::new_v4);
         sqlx::query(
@@ -95,8 +217,7 @@ impl Database {
                   symbol_type = EXCLUDED.symbol_type,
                   start_line = EXCLUDED.start_line,
                   end_line = EXCLUDED.end_line,
-                  content = EXCLUDED.content,
-                  vector_id = EXCLUDED.vector_id
+                  content = EXCLUDED.content
             "#,
         )
         .bind(id)
@@ -114,15 +235,16 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        let row = sqlx::query(
-            "SELECT id FROM chunks WHERE repo_id = $1 AND file_path = $2 AND content_hash = $3",
-        )
+        let row = sqlx::query("SELECT id, vector_id FROM chunks WHERE repo_id = $1 AND file_path = $2 AND content_hash = $3")
         .bind(repo_id)
         .bind(&chunk.file_path)
         .bind(&chunk.content_hash)
         .fetch_one(&self.pool)
         .await?;
-        Ok(row.get("id"))
+        Ok(PersistedChunkIds {
+            chunk_id: row.get("id"),
+            vector_id: row.get("vector_id"),
+        })
     }
 
     pub async fn get_chunk(&self, chunk_id: Uuid) -> anyhow::Result<SearchHit> {

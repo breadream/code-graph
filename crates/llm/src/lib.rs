@@ -9,6 +9,13 @@ use std::sync::Arc;
 #[async_trait]
 pub trait EmbeddingProvider: Send + Sync {
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>>;
+    async fn embed_batch(&self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        let mut embeddings = Vec::with_capacity(inputs.len());
+        for input in inputs {
+            embeddings.push(self.embed(input).await?);
+        }
+        Ok(embeddings)
+    }
     fn dimensions(&self) -> usize;
 }
 
@@ -51,6 +58,20 @@ pub struct MockProvider {
 #[async_trait]
 impl EmbeddingProvider for MockProvider {
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        Ok(self.embed_one(input))
+    }
+
+    async fn embed_batch(&self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        Ok(inputs.iter().map(|input| self.embed_one(input)).collect())
+    }
+
+    fn dimensions(&self) -> usize {
+        self.dim
+    }
+}
+
+impl MockProvider {
+    fn embed_one(&self, input: &str) -> Vec<f32> {
         let mut vector = vec![0.0; self.dim];
         for token in input.split(|c: char| !c.is_alphanumeric()) {
             if token.is_empty() {
@@ -63,11 +84,7 @@ impl EmbeddingProvider for MockProvider {
             vector[idx] += 1.0;
         }
         normalize(&mut vector);
-        Ok(vector)
-    }
-
-    fn dimensions(&self) -> usize {
-        self.dim
+        vector
     }
 }
 
@@ -134,6 +151,18 @@ impl OpenAiCompatibleProvider {
 #[async_trait]
 impl EmbeddingProvider for OpenAiCompatibleProvider {
     async fn embed(&self, input: &str) -> anyhow::Result<Vec<f32>> {
+        let embeddings = self.embed_batch(&[input.to_string()]).await?;
+        embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("embedding response was empty"))
+    }
+
+    async fn embed_batch(&self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        if inputs.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let resp: EmbeddingResponse = self
             .client
             .post(format!("{}/embeddings", self.base_url))
@@ -141,7 +170,7 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
             .header(CONTENT_TYPE, "application/json")
             .json(&EmbeddingRequest {
                 model: &self.embedding_model,
-                input,
+                input: inputs,
             })
             .send()
             .await
@@ -152,11 +181,20 @@ impl EmbeddingProvider for OpenAiCompatibleProvider {
             .await
             .context("failed to parse embedding response")?;
 
-        resp.data
+        let mut data = resp.data;
+        data.sort_by_key(|item| item.index);
+        let embeddings = data
             .into_iter()
-            .next()
             .map(|item| item.embedding)
-            .ok_or_else(|| anyhow!("embedding response was empty"))
+            .collect::<Vec<_>>();
+        if embeddings.len() != inputs.len() {
+            return Err(anyhow!(
+                "embedding response count mismatch: expected {}, got {}",
+                inputs.len(),
+                embeddings.len()
+            ));
+        }
+        Ok(embeddings)
     }
 
     fn dimensions(&self) -> usize {
@@ -220,7 +258,7 @@ impl ChatProvider for OpenAiCompatibleProvider {
 #[derive(Serialize)]
 struct EmbeddingRequest<'a> {
     model: &'a str,
-    input: &'a str,
+    input: &'a [String],
 }
 
 #[derive(Deserialize)]
@@ -230,6 +268,7 @@ struct EmbeddingResponse {
 
 #[derive(Deserialize)]
 struct EmbeddingItem {
+    index: usize,
     embedding: Vec<f32>,
 }
 

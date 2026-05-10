@@ -1,48 +1,59 @@
 use anyhow::Context;
 use code_graph_db::Database;
 use code_graph_shared::{CodeChunk, SearchHit};
-use reqwest::StatusCode;
-use serde::{Deserialize, Serialize};
-use serde_json::json;
-use std::collections::HashMap;
+use qdrant_client::{
+    client::{QdrantClient as GrpcQdrantClient, QdrantClientConfig},
+    prelude::Value,
+    qdrant::{
+        vectors_config::Config, Condition, CreateCollection, Distance, Filter, PointId,
+        PointStruct, SearchPoints, VectorParams, VectorsConfig,
+    },
+};
+use serde::Serialize;
+use std::{collections::HashMap, sync::Arc};
 use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct QdrantClient {
-    client: reqwest::Client,
-    base_url: String,
+    client: Arc<GrpcQdrantClient>,
     collection: String,
     vector_size: usize,
 }
 
 impl QdrantClient {
-    pub fn new(base_url: String, collection: String, vector_size: usize) -> Self {
-        Self {
-            client: reqwest::Client::new(),
-            base_url: base_url.trim_end_matches('/').to_string(),
+    pub fn new(grpc_url: String, collection: String, vector_size: usize) -> anyhow::Result<Self> {
+        let config = QdrantClientConfig::from_url(grpc_url.trim_end_matches('/'));
+        Ok(Self {
+            client: Arc::new(GrpcQdrantClient::new(Some(config))?),
             collection,
             vector_size,
-        }
+        })
     }
 
     pub async fn ensure_collection(&self) -> anyhow::Result<()> {
-        let response = self
+        if self
             .client
-            .put(format!("{}/collections/{}", self.base_url, self.collection))
-            .json(&json!({
-                "vectors": {
-                    "size": self.vector_size,
-                    "distance": "Cosine"
-                }
-            }))
-            .send()
+            .collection_exists(&self.collection)
             .await
-            .context("failed to create qdrant collection")?;
-        if response.status() != StatusCode::CONFLICT {
-            response
-                .error_for_status()
-                .context("qdrant collection creation failed")?;
+            .context("failed to check qdrant collection")?
+        {
+            return Ok(());
         }
+
+        self.client
+            .create_collection(&CreateCollection {
+                collection_name: self.collection.clone(),
+                vectors_config: Some(VectorsConfig {
+                    config: Some(Config::Params(VectorParams {
+                        size: self.vector_size as u64,
+                        distance: Distance::Cosine as i32,
+                        ..Default::default()
+                    })),
+                }),
+                ..Default::default()
+            })
+            .await
+            .context("qdrant collection creation failed")?;
         Ok(())
     }
 
@@ -54,31 +65,57 @@ impl QdrantClient {
         vector: Vec<f32>,
     ) -> anyhow::Result<Uuid> {
         let vector_id = chunk.vector_id.unwrap_or_else(Uuid::new_v4);
+
+        let payload = HashMap::<String, Value>::from([
+            ("chunk_id".to_string(), chunk_id.to_string().into()),
+            ("repo_id".to_string(), repo_id.to_string().into()),
+            ("file_path".to_string(), chunk.file_path.clone().into()),
+            ("language".to_string(), chunk.language.clone().into()),
+            ("start_line".to_string(), i64::from(chunk.start_line).into()),
+            ("end_line".to_string(), i64::from(chunk.end_line).into()),
+        ]);
+        let point = PointStruct {
+            id: Some(PointId::from(vector_id.to_string())),
+            vectors: Some(vector.into()),
+            payload,
+        };
+
         self.client
-            .put(format!(
-                "{}/collections/{}/points",
-                self.base_url, self.collection
-            ))
-            .json(&json!({
-                "points": [{
-                    "id": vector_id,
-                    "vector": vector,
-                    "payload": {
-                        "chunk_id": chunk_id,
-                        "repo_id": repo_id,
-                        "file_path": chunk.file_path,
-                        "language": chunk.language,
-                        "start_line": chunk.start_line,
-                        "end_line": chunk.end_line
-                    }
-                }]
-            }))
-            .send()
+            .upsert_points_blocking(&self.collection, None, vec![point], None)
             .await
-            .context("failed to upsert qdrant point")?
-            .error_for_status()
             .context("qdrant point upsert failed")?;
         Ok(vector_id)
+    }
+
+    pub async fn upsert_chunks_batch(&self, chunks: Vec<QdrantChunkUpsert>) -> anyhow::Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        let points = chunks
+            .into_iter()
+            .map(|item| {
+                let payload = HashMap::<String, Value>::from([
+                    ("chunk_id".to_string(), item.chunk_id.to_string().into()),
+                    ("repo_id".to_string(), item.repo_id.to_string().into()),
+                    ("file_path".to_string(), item.file_path.into()),
+                    ("language".to_string(), item.language.into()),
+                    ("start_line".to_string(), i64::from(item.start_line).into()),
+                    ("end_line".to_string(), i64::from(item.end_line).into()),
+                ]);
+                PointStruct {
+                    id: Some(PointId::from(item.vector_id.to_string())),
+                    vectors: Some(item.vector.into()),
+                    payload,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.client
+            .upsert_points_blocking(&self.collection, None, points, None)
+            .await
+            .context("qdrant batch point upsert failed")?;
+        Ok(())
     }
 
     pub async fn search(
@@ -87,39 +124,34 @@ impl QdrantClient {
         vector: Vec<f32>,
         top_k: usize,
     ) -> anyhow::Result<Vec<VectorHit>> {
-        let resp: QdrantSearchResponse = self
+        let response = self
             .client
-            .post(format!(
-                "{}/collections/{}/points/search",
-                self.base_url, self.collection
-            ))
-            .json(&json!({
-                "vector": vector,
-                "limit": top_k,
-                "with_payload": true,
-                "filter": {
-                    "must": [{
-                        "key": "repo_id",
-                        "match": { "value": repo_id }
-                    }]
-                }
-            }))
-            .send()
+            .search_points(&SearchPoints {
+                collection_name: self.collection.clone(),
+                vector,
+                filter: Some(Filter::must([Condition::matches(
+                    "repo_id",
+                    repo_id.to_string(),
+                )])),
+                limit: top_k as u64,
+                with_payload: Some(true.into()),
+                ..Default::default()
+            })
             .await
-            .context("failed to search qdrant")?
-            .error_for_status()
-            .context("qdrant search failed")?
-            .json()
-            .await
-            .context("failed to parse qdrant search response")?;
+            .context("qdrant search failed")?;
 
-        Ok(resp
+        Ok(response
             .result
             .into_iter()
             .filter_map(|item| {
-                let chunk_id = item.payload.and_then(|payload| payload.chunk_id)?;
+                let chunk_id = item
+                    .payload
+                    .get("chunk_id")?
+                    .kind
+                    .as_ref()
+                    .and_then(qdrant_value_as_str)?;
                 Some(VectorHit {
-                    chunk_id,
+                    chunk_id: Uuid::parse_str(chunk_id).ok()?,
                     score: item.score,
                 })
             })
@@ -127,26 +159,28 @@ impl QdrantClient {
     }
 }
 
+pub struct QdrantChunkUpsert {
+    pub chunk_id: Uuid,
+    pub repo_id: Uuid,
+    pub vector_id: Uuid,
+    pub file_path: String,
+    pub language: String,
+    pub start_line: i32,
+    pub end_line: i32,
+    pub vector: Vec<f32>,
+}
+
+fn qdrant_value_as_str(kind: &qdrant_client::qdrant::value::Kind) -> Option<&str> {
+    match kind {
+        qdrant_client::qdrant::value::Kind::StringValue(value) => Some(value),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VectorHit {
     pub chunk_id: Uuid,
     pub score: f32,
-}
-
-#[derive(Deserialize)]
-struct QdrantSearchResponse {
-    result: Vec<QdrantScoredPoint>,
-}
-
-#[derive(Deserialize)]
-struct QdrantScoredPoint {
-    score: f32,
-    payload: Option<QdrantPayload>,
-}
-
-#[derive(Deserialize)]
-struct QdrantPayload {
-    chunk_id: Option<Uuid>,
 }
 
 #[derive(Clone)]

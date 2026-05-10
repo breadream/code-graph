@@ -5,6 +5,7 @@ use uuid::Uuid;
 pub struct AppConfig {
     pub database_url: String,
     pub qdrant_url: String,
+    pub qdrant_grpc_url: String,
     pub qdrant_collection: String,
     pub embedding_dim: usize,
     pub provider: ProviderConfig,
@@ -40,6 +41,8 @@ impl AppConfig {
             }),
             qdrant_url: std::env::var("QDRANT_URL")
                 .unwrap_or_else(|_| "http://localhost:6333".to_string()),
+            qdrant_grpc_url: std::env::var("QDRANT_GRPC_URL")
+                .unwrap_or_else(|_| "http://localhost:6334".to_string()),
             qdrant_collection: std::env::var("QDRANT_COLLECTION")
                 .unwrap_or_else(|_| "code_chunks".to_string()),
             embedding_dim: std::env::var("EMBEDDING_DIM")

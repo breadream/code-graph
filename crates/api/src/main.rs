@@ -40,10 +40,10 @@ async fn main() -> anyhow::Result<()> {
     let db = Database::connect(&config.database_url).await?;
     let providers = build_providers(&config.provider, config.embedding_dim)?;
     let qdrant = QdrantClient::new(
-        config.qdrant_url.clone(),
+        config.qdrant_grpc_url.clone(),
         config.qdrant_collection.clone(),
         providers.embeddings.dimensions(),
-    );
+    )?;
     let indexer = Indexer::new(db.clone(), qdrant.clone(), providers.embeddings.clone());
     let retriever = Retriever::new(db.clone(), qdrant);
 

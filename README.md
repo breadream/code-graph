@@ -56,31 +56,69 @@ make reset
 | Service | URL | Purpose |
 | --- | --- | --- |
 | Postgres | `postgres://codegraph:codegraph@localhost:5432/codegraph` | Relational source of truth |
-| Qdrant HTTP | `http://localhost:6333` | Vector database API |
-| Qdrant gRPC | `localhost:6334` | Optional high-throughput vector API |
+| Qdrant HTTP | `http://localhost:6333` | Dashboard and REST inspection API |
+| Qdrant gRPC | `localhost:6334` | Application vector database API |
 
 ## Architecture
 
 ```text
-Repository URL/path
+Indexing path
+-------------
+
+Repository URL/path or local checkout
       |
       v
-Rust ingestion worker
+Rust indexer
       |
-      +--> file discovery and language detection
-      +--> chunking and symbol-aware metadata
-      +--> embedding model
-               |
-               +--> Qdrant collection: code_chunks
-               |
-               +--> Postgres tables:
-                    repositories
-                    files
-                    chunks
-                    query_logs
+      +--> walk files and ignore vendor/build directories
+      +--> detect language from file extension
+      +--> split files into code chunks
+      |
+      +--> OpenAI-compatible embeddings API, or local mock provider
+      |       |
+      |       v
+      |     chunk embedding vector
+      |
+      +--> Postgres
+      |       repositories, files, chunks, query_logs
+      |       stores readable source text, line ranges, hashes, and vector_id
+      |
+      +--> Qdrant
+              collection: code_chunks or configured QDRANT_COLLECTION
+              stores vector_id, embedding vector, and payload metadata
+
+Query path
+----------
+
+Question
+      |
+      +--> OpenAI-compatible embeddings API, or local mock provider
+      |       |
+      |       v
+      |     question embedding vector
+      |
+      +--> Qdrant vector search
+      |       finds semantically similar chunk vectors
+      |
+      +--> Postgres keyword fallback
+      |       finds literal/code-token matches
+      |
+      v
+Merge and deduplicate retrieved chunks
+      |
+      v
+Postgres fetches chunk content and citation metadata
+      |
+      v
+OpenAI-compatible chat API, or local mock provider
+      |
+      v
+Cited answer + retrieval trace
 ```
 
-Postgres owns durable metadata and audit history. Qdrant owns nearest-neighbor search over embedding vectors. Chunks bridge the two stores through `chunks.qdrant_point_id`.
+Postgres owns durable metadata, readable source chunks, and query history. Qdrant owns nearest-neighbor search over embedding vectors. Chunks bridge the two stores through `chunks.vector_id`, which is used as the Qdrant point id.
+
+The OpenAI-compatible layer does not train on the repository. During indexing, it converts each code chunk into an embedding vector. During querying, it converts the question into an embedding vector and, after retrieval, uses the chat model to explain the retrieved snippets with citations. Qdrant does not create embeddings or generate answers; it stores vectors and performs similarity search.
 
 ## Database Schema
 
@@ -164,20 +202,45 @@ You can skip the HTTP API entirely for day-to-day use. Start the backing stores 
 ```sh
 make up
 make migrate
-cargo install --path crates/api --bin insight
+cargo install --path crates/api --bin insight --force
 ```
 
-Then go into any cloned repository and ask a question:
+Then go into any cloned repository and build the reusable index:
 
 ```sh
 cd /path/to/cloned/repo
+insight index
+```
+
+Repeat questions are fast because they reuse the existing Postgres metadata and Qdrant vectors:
+
+```sh
+insight ask "Where is authentication handled?"
+insight ask --top-k 12 "How does billing work?"
+```
+
+Check what is indexed:
+
+```sh
+insight status
+```
+
+Rebuild the index after code changes:
+
+```sh
+insight refresh
+```
+
+The old one-shot form still works, but it reindexes before answering:
+
+```sh
 insight "Where is authentication handled?"
 ```
 
-Optional flags:
+Optional flags work with each command:
 
 ```sh
-insight --path /path/to/repo --repo-name my-project --branch main --top-k 8 "How does billing work?"
+insight ask --path /path/to/repo --repo-name my-project --branch main --top-k 8 "How does billing work?"
 ```
 
 ## API Demo Curls
@@ -227,7 +290,8 @@ Copy `.env.example` to `.env` and adjust as needed. Keep secrets out of git.
 Important variables:
 
 - `DATABASE_URL`: application Postgres connection string.
-- `QDRANT_URL`: Qdrant HTTP endpoint.
+- `QDRANT_URL`: Qdrant HTTP endpoint for dashboard/curl inspection.
+- `QDRANT_GRPC_URL`: Qdrant gRPC endpoint used by the Rust app.
 - `QDRANT_COLLECTION`: collection name for chunk embeddings.
 - `PROVIDER_MODE`: `mock` for local deterministic embeddings/answers, or `openai_compatible`.
 - `EMBEDDING_DIM`: embedding vector dimension. Must match the configured embedding model and Qdrant collection.
@@ -240,7 +304,7 @@ Important variables:
 - Extension-based language detection.
 - Function/class-like symbol chunking for Rust, TypeScript/JavaScript, and Python, with line-based fallback chunking.
 - Postgres metadata persistence for repositories, files, chunks, and query logs.
-- Qdrant collection creation, vector upsert, and vector search.
+- Qdrant gRPC collection creation, vector upsert, and vector search.
 - Keyword fallback via Postgres `ILIKE`.
 - Mock and OpenAI-compatible provider abstractions for embeddings and chat answers.
 

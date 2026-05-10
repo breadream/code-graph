@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context};
 use code_graph_db::Database;
 use code_graph_llm::EmbeddingProvider;
 use code_graph_parser::{chunk_source, hash_content, ChunkOptions};
-use code_graph_retriever::QdrantClient;
+use code_graph_retriever::{QdrantChunkUpsert, QdrantClient};
 use code_graph_shared::RepoRequest;
 use git2::{build::RepoBuilder, Repository};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,49 @@ pub struct IndexSummary {
     pub repo_id: Uuid,
     pub files_indexed: usize,
     pub chunks_indexed: usize,
+}
+
+#[derive(Debug, Clone)]
+pub enum IndexProgress {
+    Preparing,
+    DiscoveredFiles {
+        total_files: usize,
+    },
+    FileStarted {
+        current_file: usize,
+        total_files: usize,
+        path: String,
+    },
+    FileSkipped {
+        current_file: usize,
+        total_files: usize,
+        path: String,
+        chunks: usize,
+    },
+    EmbeddingBatch {
+        current_file: usize,
+        total_files: usize,
+        batch_start: usize,
+        batch_end: usize,
+        file_chunks: usize,
+    },
+    UpsertingBatch {
+        current_file: usize,
+        total_files: usize,
+        batch_start: usize,
+        batch_end: usize,
+        file_chunks: usize,
+    },
+    ChunkIndexed {
+        current_file: usize,
+        total_files: usize,
+        file_chunks: usize,
+        total_chunks: usize,
+    },
+    Finished {
+        files_indexed: usize,
+        chunks_indexed: usize,
+    },
 }
 
 #[derive(Clone)]
@@ -35,6 +78,18 @@ impl Indexer {
     }
 
     pub async fn index_repo(&self, request: RepoRequest) -> anyhow::Result<IndexSummary> {
+        self.index_repo_with_progress(request, |_| {}).await
+    }
+
+    pub async fn index_repo_with_progress<F>(
+        &self,
+        request: RepoRequest,
+        mut progress: F,
+    ) -> anyhow::Result<IndexSummary>
+    where
+        F: FnMut(IndexProgress),
+    {
+        progress(IndexProgress::Preparing);
         let branch = request.branch.clone().unwrap_or_else(|| "main".to_string());
         let checkout = Checkout::prepare(&request, &branch)?;
         let commit_sha = git_commit_sha(checkout.path()).ok();
@@ -53,19 +108,16 @@ impl Indexer {
 
         self.qdrant.ensure_collection().await?;
 
+        let files = discover_source_files(checkout.path());
+        let total_files = files.len();
+        progress(IndexProgress::DiscoveredFiles { total_files });
+
         let mut files_indexed = 0usize;
         let mut chunks_indexed = 0usize;
+        let mut seen_paths = Vec::with_capacity(total_files);
 
-        for entry in WalkDir::new(checkout.path())
-            .into_iter()
-            .filter_entry(|entry| !is_ignored(entry))
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            if !is_likely_source(path) {
-                continue;
-            }
+        for (file_idx, path) in files.iter().enumerate() {
+            let current_file = file_idx + 1;
             let content = match tokio::fs::read_to_string(path).await {
                 Ok(content) => content,
                 Err(_) => continue,
@@ -79,36 +131,113 @@ impl Indexer {
                 .unwrap_or(path)
                 .to_string_lossy()
                 .replace('\\', "/");
+            seen_paths.push(rel_path.clone());
+            progress(IndexProgress::FileStarted {
+                current_file,
+                total_files,
+                path: rel_path.clone(),
+            });
             let chunks = chunk_source(&rel_path, &content, &ChunkOptions::default());
             if chunks.is_empty() {
                 continue;
             }
 
             let file_hash = hash_content(&content);
+            if let Some(existing) = self.db.get_indexed_file(repo_id, &rel_path).await? {
+                if existing.content_hash == file_hash && existing.chunk_count > 0 {
+                    files_indexed += 1;
+                    chunks_indexed += existing.chunk_count as usize;
+                    progress(IndexProgress::FileSkipped {
+                        current_file,
+                        total_files,
+                        path: rel_path,
+                        chunks: existing.chunk_count as usize,
+                    });
+                    continue;
+                }
+                self.db.delete_file(repo_id, &rel_path).await?;
+            }
+
             let file_id = self
                 .db
                 .upsert_file(repo_id, &rel_path, &chunks[0].language, &file_hash)
                 .await?;
             files_indexed += 1;
 
-            for mut chunk in chunks {
-                chunk.repo_id = Some(repo_id);
-                chunk.vector_id = Some(Uuid::new_v4());
-                let vector = self.embeddings.embed(&chunk.content).await?;
-                let chunk_id = self.db.insert_chunk(repo_id, file_id, &chunk).await?;
-                self.qdrant
-                    .upsert_chunk(chunk_id, repo_id, &chunk, vector)
-                    .await?;
-                chunks_indexed += 1;
+            let file_chunks = chunks.len();
+            for (batch_start, batch) in chunks.chunks(32).enumerate() {
+                let start = batch_start * 32 + 1;
+                let end = start + batch.len() - 1;
+                progress(IndexProgress::EmbeddingBatch {
+                    current_file,
+                    total_files,
+                    batch_start: start,
+                    batch_end: end,
+                    file_chunks,
+                });
+                let inputs = batch
+                    .iter()
+                    .map(|chunk| chunk.content.clone())
+                    .collect::<Vec<_>>();
+                let vectors = self.embeddings.embed_batch(&inputs).await?;
+                progress(IndexProgress::UpsertingBatch {
+                    current_file,
+                    total_files,
+                    batch_start: start,
+                    batch_end: end,
+                    file_chunks,
+                });
+                let mut upserts = Vec::with_capacity(batch.len());
+                for (chunk, vector) in batch.iter().cloned().zip(vectors) {
+                    let mut chunk = chunk;
+                    chunk.repo_id = Some(repo_id);
+                    chunk.vector_id = Some(Uuid::new_v4());
+                    let persisted = self.db.insert_chunk(repo_id, file_id, &chunk).await?;
+                    chunk.vector_id = Some(persisted.vector_id);
+                    upserts.push(QdrantChunkUpsert {
+                        chunk_id: persisted.chunk_id,
+                        repo_id,
+                        vector_id: persisted.vector_id,
+                        file_path: chunk.file_path,
+                        language: chunk.language,
+                        start_line: chunk.start_line,
+                        end_line: chunk.end_line,
+                        vector,
+                    });
+                }
+                self.qdrant.upsert_chunks_batch(upserts).await?;
+                chunks_indexed += batch.len();
+                progress(IndexProgress::ChunkIndexed {
+                    current_file,
+                    total_files,
+                    file_chunks: end,
+                    total_chunks: chunks_indexed,
+                });
             }
         }
 
+        self.db.delete_files_except(repo_id, &seen_paths).await?;
+        progress(IndexProgress::Finished {
+            files_indexed,
+            chunks_indexed,
+        });
         Ok(IndexSummary {
             repo_id,
             files_indexed,
             chunks_indexed,
         })
     }
+}
+
+fn discover_source_files(root: &Path) -> Vec<PathBuf> {
+    WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|entry| !is_ignored(entry))
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .filter(|path| is_likely_source(path))
+        .collect()
 }
 
 struct Checkout {
