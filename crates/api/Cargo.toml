@@ -1,0 +1,31 @@
+[package]
+name = "code_graph_api"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "api"
+path = "src/main.rs"
+
+[[bin]]
+name = "insight"
+path = "src/bin/insight.rs"
+
+[dependencies]
+anyhow.workspace = true
+axum.workspace = true
+code_graph_db = { path = "../db" }
+code_graph_indexer = { path = "../indexer" }
+code_graph_llm = { path = "../llm" }
+code_graph_retriever = { path = "../retriever" }
+code_graph_shared = { path = "../shared" }
+dotenvy.workspace = true
+git2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

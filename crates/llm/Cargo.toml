@@ -1,0 +1,17 @@
+[package]
+name = "code_graph_llm"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+code_graph_shared = { path = "../shared" }
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true

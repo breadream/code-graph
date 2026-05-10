@@ -1,0 +1,12 @@
+[package]
+name = "code_graph_db"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+code_graph_shared = { path = "../shared" }
+sqlx.workspace = true
+uuid.workspace = true
+tracing.workspace = true

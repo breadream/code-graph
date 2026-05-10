@@ -1,0 +1,11 @@
+[package]
+name = "code_graph_parser"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+code_graph_shared = { path = "../shared" }
+regex.workspace = true
+sha2.workspace = true
+hex.workspace = true

@@ -1,0 +1,10 @@
+[package]
+name = "code_graph_shared"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+serde.workspace = true
+uuid.workspace = true
+chrono.workspace = true

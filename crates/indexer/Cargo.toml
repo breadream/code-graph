@@ -1,0 +1,21 @@
+[package]
+name = "code_graph_indexer"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+code_graph_db = { path = "../db" }
+code_graph_llm = { path = "../llm" }
+code_graph_parser = { path = "../parser" }
+code_graph_retriever = { path = "../retriever" }
+code_graph_shared = { path = "../shared" }
+git2.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
+tracing.workspace = true
